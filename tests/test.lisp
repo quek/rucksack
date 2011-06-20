@@ -1,4 +1,4 @@
-;; $Id: test.lisp,v 1.2 2008/02/11 12:47:53 alemmens Exp $
+;; $Id: test.lisp,v 1.3 2011/06/20 17:22:22 alemmens Exp $
 
 (in-package :rucksack-test)
 
@@ -42,6 +42,14 @@
 
   (test (not (current-rucksack)))
 
+  ;; Non-simple strings without fill-pointers should be serialized without any problems.
+  (let ((str (make-array '(0)
+                         :element-type 'character
+                         :adjustable t
+                         :fill-pointer nil)))
+    (p-test (p-list str)
+            (equal "" (p-car it))))
+  
   ;;
   ;; P-CONS, P-CAR, P-CDR, P-LIST, P-MAKE-ARRAY, P-AREF
   ;;
@@ -58,7 +66,6 @@
   (p-test (p-make-array 2 :initial-contents '(a b))
 	  (equal '(a b)
 	       (list (p-aref it 0) (p-aref it 1))))
-
 
   ;;
   ;; Persistent-objects

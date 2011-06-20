@@ -1,4 +1,4 @@
-;; $Id: serialize.lisp,v 1.10 2007/01/22 10:23:14 alemmens Exp $
+;; $Id: serialize.lisp,v 1.11 2011/06/20 17:22:15 alemmens Exp $
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Serialize
@@ -905,7 +905,9 @@ implementation-dependent attributes."
                               type)))))
         (serialize-marker type-marker stream))
       (unless simple-p
-        (serialize (fill-pointer string) stream)
+        (serialize (and (array-has-fill-pointer-p string)
+                        (fill-pointer string))
+                   stream)
         (serialize (adjustable-array-p string) stream))
       (serialize (length string) stream)
       (loop for char across string

@@ -1,3 +1,8 @@
+* 2011-06-20 - version 0.1.21
+
+Fix a bug reported by pixel@kepibu.org: don't assume that non-simple
+strings always have fill-pointers when serializing.
+
 * 2009-05-27 - version 0.1.20
 
 Fix a bug in the creation of transaction-ids (bug reported by Klaus
