@@ -81,7 +81,7 @@ the 'real' heap."))
   (- +pointer-size+ +nr-object-info-octets+))
 
 (defun (setf object-heap-position) (position object-table id)
-  (let ((stream (heap-stream object-table)))
+  (with-heap-stream (stream object-table)
     (file-position stream
                    (+ (block-header-size object-table)
                       +nr-object-info-octets+
@@ -90,7 +90,7 @@ the 'real' heap."))
   position)
 
 (defun object-heap-position (object-table id)
-  (let ((stream (heap-stream object-table)))
+  (with-heap-stream (stream object-table)
     (file-position stream
                    (+ (block-header-size object-table)
                       +nr-object-info-octets+
@@ -100,7 +100,7 @@ the 'real' heap."))
 
 (defun object-info (object-table id)
   "Returns either :free-block, :dead-object, :live-object or :reserved."
-  (let ((stream (heap-stream object-table)))
+  (with-heap-stream (stream object-table)
     (file-position stream
                    (+ (block-header-size object-table)
                       (object-id-to-block id object-table)))
@@ -108,7 +108,7 @@ the 'real' heap."))
 
 
 (defun (setf object-info) (info object-table id)
-  (let ((stream (heap-stream object-table)))
+  (with-heap-stream (stream object-table)
     (file-position stream
                    (+ (block-header-size object-table)
                       (object-id-to-block id object-table)))

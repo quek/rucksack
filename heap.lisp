@@ -12,11 +12,19 @@
 * open-heap [Function]
 
 * close-heap [Function]
-|# 
+|#
 
+(defmacro with-heap-stream ((var heap) &body body)
+  (let ((gheap (gensym "heap"))
+        (glock (gensym "lock")))
+    `(let* ((,gheap ,heap)
+            (,var (slot-value ,gheap 'stream))
+            (,glock (slot-value ,gheap 'stream-lock)))
+       (with-recursive-lock (,glock)
+         ,@body))))
 
-(defgeneric heap-stream (heap)
-  (:documentation "Returns the heap's stream."))
+;;(defgeneric heap-stream (heap)
+;;  (:documentation "Returns the heap's stream."))
 
 (defgeneric heap-start (heap)
   (:documentation "Returns the position of the first block in the heap."))
@@ -37,6 +45,9 @@ were allocated.
 Note: both the requested size and the returned heap position include
 the block's header."))
 
+(defgeneric deallocate-block (block heap)
+  (:documentation "Deallocate a block."))
+
 ;; DO: Many more generic functions.
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -48,8 +59,30 @@ the block's header."))
 must be able to span the entire heap.  It is used for block sizes, pointers
 to other blocks, object ids and object heap positions.")
 
-(defclass heap ()
-  ((stream :initarg :stream :accessor heap-stream)
+
+(defmacro with-allocation-lock ((allocation-lock) &body body)
+  (let ((lock (gensym "lock")))
+    `(let ((,lock (slot-value ,allocation-lock 'allocation-lock)))
+       (with-recursive-lock (,lock)
+         ,@body))))
+
+(defclass allocation-lock ()
+  ((allocation-lock :initform (make-lock :name "heap-allocation-lock")
+                    :documentation "A lock for allocate-block and deallocate-block")))
+
+(defmethod allocate-block :around ((allocation-lock allocation-lock) &key &allow-other-keys)
+  (with-allocation-lock (allocation-lock)
+    (call-next-method)))
+
+(defmethod deallocate-block (block (allocation-lock allocation-lock))
+  (with-allocation-lock (allocation-lock)
+    (call-next-method)))
+
+
+(defclass heap (allocation-lock)
+  ((stream-lock :initform (make-lock :name "heap-stream-lock")
+                :documentation "A lock for stream.")
+   (stream :initarg :stream)
    (cell-buffer :initform (make-array +pointer-size+
                                       :element-type '(unsigned-byte 8))
                 ;; Just a buffer for 1 cell.
@@ -67,7 +100,7 @@ If nil, the heap is allowed to expand indefinitely.")
                         :documentation "The number of octets that have been
 allocated by ALLOCATE-BLOCK since the last time that RESET-ALLOCATION-COUNTER
 was called.")))
-                        
+
 
 
 ;;
@@ -91,10 +124,13 @@ was called.")))
 
 
 (defmethod close-heap ((heap heap))
-  (close (heap-stream heap)))
+  (with-heap-stream (stream heap)
+    (close stream)))
+
 
 (defmethod finish-heap-output ((heap heap))
-  (finish-output (heap-stream heap)))
+  (with-heap-stream (stream heap)
+    (finish-output stream)))
 
 
 (defmethod heap-size ((heap heap))
@@ -105,14 +141,16 @@ was called.")))
 ;;
 
 (defun pointer-value (pointer heap)
-  (file-position (heap-stream heap) pointer)
-  (read-unsigned-bytes (cell-buffer heap) (heap-stream heap)
-                       +pointer-size+))
+  (with-heap-stream (stream heap)
+    (file-position stream pointer)
+    (read-unsigned-bytes (cell-buffer heap) stream
+                         +pointer-size+)))
 
 (defun (setf pointer-value) (value pointer heap)
-  (file-position (heap-stream heap) pointer)
-  (write-unsigned-bytes value (cell-buffer heap) (heap-stream heap)
-                        +pointer-size+)
+  (with-heap-stream (stream heap)
+    (file-position stream pointer)
+    (write-unsigned-bytes value (cell-buffer heap) stream
+                          +pointer-size+))
   value)
 
 ;;
@@ -193,9 +231,9 @@ contains a pointer to the next block on the same free list."))
 (defmethod initialize-instance :after ((heap free-list-heap)
                                        &key &allow-other-keys)
   ;; Initialize the heap end.
-  (if (zerop (file-length (heap-stream heap)))
+  (if (zerop (with-heap-stream (stream heap) (file-length stream)))
       (setf (heap-end heap) +pointer-size+)
-    (setf (slot-value heap 'end) (pointer-value 0 heap)))
+      (setf (slot-value heap 'end) (pointer-value 0 heap)))
   ;; Load or create the array of free list pointers.
   (setf (slot-value heap 'starts)
         (make-array (nr-free-lists heap)))
@@ -475,7 +513,7 @@ list."
     (values block size)))
 
 (defmethod (setf heap-end) :after (end (heap appending-heap))
-  (let ((stream (heap-stream heap)))
+  (with-heap-stream (stream heap)
     (file-position stream end)
     ;; Write new end to the end of the file.
     (serialize-marker +positive-byte-48+ stream)
@@ -485,20 +523,20 @@ list."
   0)
 
 (defmethod load-heap-end ((heap appending-heap))
-  (let* ((stream (heap-stream heap))
-         ;; 7 octets: one for a marker, 6 for a byte-48.
-         (pos (- (file-length stream) 7)))
-    (file-position stream pos)
-    (let ((end (deserialize stream)))
-      (unless (= end pos)
-        (error "Heap may be corrupt (heap-end info is missing."))
-      (setf (slot-value heap 'end) end))))
+  (with-heap-stream (stream heap)
+    ;; 7 octets: one for a marker, 6 for a byte-48.
+    (let* ((pos (- (file-length stream) 7)))
+      (file-position stream pos)
+      (let ((end (deserialize stream)))
+        (unless (= end pos)
+          (error "Heap may be corrupt (heap-end info is missing."))
+        (setf (slot-value heap 'end) end)))))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Little utility functions
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  
+
 (defun write-unsigned-bytes (integer buffer stream
                                      &optional (nr-octets +pointer-size+))
   (declare (ignore buffer nr-octets))

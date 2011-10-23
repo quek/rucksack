@@ -87,10 +87,11 @@
                       (unwrap (p-replace plist (p-list 4 5 6))))))))
 
 
-(defclass basic-persist ()
-  ((data :initarg :data :accessor data)
-   (cached :initform nil :initarg :cached :accessor cached :persistence nil))
-  (:metaclass persistent-class))
+(with-rucksack-and-transaction ()
+  (defclass basic-persist ()
+    ((data :initarg :data :accessor data)
+     (cached :initform nil :initarg :cached :accessor cached :persistence nil))
+    (:metaclass persistent-class)))
 
 (define-test basic-persistence 
   "Tests basic objects existing over an open/close of a rucksack"
@@ -259,3 +260,68 @@
       (assert-equal 1 (p-car pc)))))
 
 
+
+(define-test parallel-transaction
+  (setf rucksack::*rucksack* (open-rucksack *rucksack-unit-tests* :if-exists :supersede))
+  (unwind-protect
+       (handler-bind ((rucksack:transaction-conflict
+                        (lambda (c)
+                          (print c)
+                          (invoke-restart 'rucksack::retry))))
+         (with-transaction ()
+           (defclass foo-persist ()
+             ((value :initarg :value :accessor value))
+             (:index t)
+             (:metaclass persistent-class))
+           (defmethod print-object ((object foo-persist) stream)
+             (print-unreadable-object (object stream :type t)
+               (format stream "~a ~d"
+                       (and (slot-boundp object 'rucksack::object-id) (object-id object))
+                       (and (slot-boundp object 'value) (value object))))))
+         (loop repeat 11
+               collect (bt:make-thread (lambda ()
+                                         (sleep (random 0.01))
+                                         (handler-bind ((rucksack:transaction-conflict
+                                                          (lambda (c)
+                                                            (print c)
+                                                            (invoke-restart 'rucksack::retry))))
+                                           (with-transaction ()
+                                             (loop repeat 10 do
+                                               (make-instance 'foo-persist :value 0))))))
+                 into threads
+               finally
+                  (sleep 0.1)
+                  (with-transaction ()
+                    (let (to-delete)
+                      (block collect
+                        (rucksack-do-class (foo 'foo-persist)
+                          (push foo to-delete)
+                          (when (= 10 (length to-delete))
+                            (return-from collect))))
+                      (loop for x in to-delete
+                            do (rucksack-delete-object (current-rucksack) x))))
+                  (loop for x in threads do (bt:join-thread x)))
+         (loop repeat 10
+               collect (bt:make-thread (lambda ()
+                                         (sleep (random 0.01))
+                                         (handler-bind ((rucksack:transaction-conflict
+                                                          (lambda (c)
+                                                            (print c)
+                                                            (invoke-restart 'rucksack::retry))))
+                                           (with-transaction ()
+                                             (loop repeat 10 do
+                                               (rucksack-do-class (foo 'foo-persist)
+                                                 (incf (value foo))))))))
+                 into threads
+               finally (loop for x in threads do (bt:join-thread x)))
+         (with-transaction ()
+           (let ((data 0)
+                 (count 0))
+             (rucksack-do-class (foo 'foo-persist)
+               ;; (print foo)
+               (incf data (value foo))
+               (incf count))
+             (print count)
+             ;; (print data)
+             (assert-equal 10000 data))))
+    (close-rucksack rucksack::*rucksack*)))

@@ -128,11 +128,19 @@ less time and less memory to do its work.  Disadvantage is that it's
 very stupid about the objects it should try to keep in memory."))
 
 
+(defclass concurrent-cache (lazy-cache)
+  ()
+  (:documentation "concurrent-cache doesn't user objects slots.
+objects slot of concurrent-transaction is used.
+any object is not shared with each transaction."))
+
+
 (defmethod print-object ((cache standard-cache) stream)
   (print-unreadable-object (cache stream :type t :identity nil)
     (format stream "of size ~D, heap ~S and ~D objects in memory."
             (cache-size cache)
-            (pathname (heap-stream (heap cache)))
+            (with-heap-stream (s (heap cache))
+              (pathname s))
             (cache-count cache))))
 
 
@@ -216,8 +224,7 @@ very stupid about the objects it should try to keep in memory."))
 
 
 (defun commit-filename (cache)
-  (merge-pathnames "commit"
-                   (pathname (heap-stream (heap cache)))))
+  (merge-pathnames "commit" (pathname (slot-value (heap cache) 'stream))))
 
 
 ;;
@@ -275,6 +282,15 @@ already dirty, nothing happens."
       ;; Let the transaction keep track of the dirty object.
       (transaction-touch-object transaction object object-id))))
 
+(defmethod cache-touch-object (object (cache concurrent-cache))
+  "Checks for transaction conflicts and wait for commit.
+Change the object's status to dirty.  If the object is already dirty,
+nothing happens."
+  ;; This function is called by (SETF SLOT-VALUE-USING-CLASS),
+  ;; SLOT-MAKUNBOUND-USING-CLASS and P-DATA-WRITE.
+  (let ((object-id (object-id object))
+        (transaction (current-transaction)))
+    (transaction-touch-object transaction object object-id)))
 
 
 (defmethod cache-get-object (object-id (cache standard-cache))
@@ -311,35 +327,41 @@ already dirty, nothing happens."
     (add-to-queue object-id cache)
     result))
 
+(defmethod cache-get-object (object-id (cache concurrent-cache))
+  (let* ((transaction (current-transaction))
+         (result (or
+                 ;; Unmodified, already loaded and compatible with the
+                 ;; current transaction?  Fine, let's use it.
+                 (gethash object-id (objects cache))
+                 ;; New object.
+                 (transaction-changed-object transaction object-id)
+                 ;; Not in memory at all? Then load the compatible version
+                 ;; from disk.
+                 (multiple-value-bind (object most-recent-p)
+                     (load-object object-id transaction cache)
+                   (declare (ignore most-recent-p))
+                   ;; Add to in-memory cache if the loaded object is
+                   ;; the most recent version of the object.
+                   (when (cache-full-p cache)
+                     (make-room-in-cache cache))
+                   (setf (gethash object-id (objects cache)) object)
+                   object))))
+    ;; Put it (back) in front of the queue, so we know which
+    ;; objects were recently used when we need to make room
+    ;; in the cache.
+    ;; DO: If this object was already in the queue, we should remove it
+    ;; from the old position.  But that's too expensive: so we actually
+    ;; need a better data structure than a simple queue.
+    (add-to-queue object-id cache)
+    result))
 
 (defun find-object-version (object-id current-transaction cache)
   "Returns the object version for OBJECT-ID that's compatible with
 CURRENT-TRANSACTION, or NIL if there's no such version in the cache
 memory."
-  ;; The compatible object version for a transaction T is the version that
-  ;; was modified by the youngest open transaction that's older than or
-  ;; equal to T; if there is no such transaction, the compatible object
-  ;; version is the most recent (committed) version on disk.
-  ;; EFFICIENCY: Maybe we should use another data structure than a
-  ;; hash table for faster searching in the potentially relevant
-  ;; transactions?  An in-memory btree might be good...
   (and current-transaction
-       (or 
-        ;; Modified by the current-transaction itself?  Then use that version.
-        (transaction-changed-object current-transaction object-id)
-        ;; Otherwise iterate over all open transactions, keeping track
-        ;; of the best candidate.
-        (let ((result-transaction nil)
-              (result nil))
-          (loop for transaction being the hash-value of (transactions cache)
-                for object = (transaction-changed-object transaction object-id)
-                when (and object
-                          (transaction-older-p transaction current-transaction)
-                          (or (null result-transaction)
-                              (transaction-older-p result-transaction transaction)))
-                do (setf result-transaction transaction
-                         result object))
-          result))))
+       ;; Modified by the current-transaction itself?  Then use that version.
+       (transaction-changed-object current-transaction object-id)))
 
 
 (defmethod cache-delete-object (object-id (cache standard-cache))

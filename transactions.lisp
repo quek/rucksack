@@ -52,6 +52,18 @@ objects are written to disk in the same order \(this is necessary to
 guarantee that the garbage collector never sees an id of an object
 that doesn't exist on disk yet.")))
 
+(defclass concurrent-transaction (standard-transaction)
+  ((objects :initarg :objects
+            :initform (make-hash-table)
+            :reader objects
+            :documentation "A hash-table \(from id to object)
+containing the youngest committed version of all objects that are
+currently kept in memory but are not dirty.  \('The youngest version'
+means the version belonging to the youngest committed transaction.)")))
+
+(defmethod objects ((cache concurrent-cache))
+  (objects (current-transaction)))
+
 (defmethod print-object ((transaction transaction) stream)
   (print-unreadable-object (transaction stream :type t :identity nil)
     (format stream "#~D with ~D dirty object~:P"
@@ -140,6 +152,18 @@ returns nil."))
     ;; And return the new transaction.
     transaction))
 
+(defmethod transaction-start-1 ((cache standard-cache)
+                                (rucksack concurrent-transaction-rucksack)
+                                &key &allow-other-keys)
+  (with-global-lock (rucksack)
+    ;; Create new transaction.
+    (let* ((id (incf (highest-transaction-id rucksack)))
+           (transaction (make-instance 'concurrent-transaction :id id)))
+      ;; Add to open transactions.
+      (open-transaction cache transaction)
+      ;; And return the new transaction.
+      transaction)))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Rucksacks with serial transactions
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -166,6 +190,34 @@ at a time."))
                                           (rucksack serial-transaction-rucksack))
   (process-unlock (rucksack-transaction-lock rucksack)))
 
+(defmethod transaction-commit-1 :around ((transaction concurrent-transaction)
+                                         (cache standard-cache)
+                                         (rucksack concurrent-transaction-rucksack))
+  (with-global-lock (rucksack)
+    (check-confilict transaction cache)
+    (call-next-method)))
+
+(defun check-confilict (transaction cache)
+  (loop with heap = (heap cache)
+        with object-table = (object-table heap)
+        for object being the hash-value of (dirty-objects transaction)
+        for object-id = (object-id object)
+        if (and (not (eql :reserved (object-info object-table object-id)))
+                (/= (load-transaction-id heap object-id)
+                    (transaction-id object)))
+          do (close-transaction cache transaction)
+             (rucksack-error 'transaction-conflict
+                        :object-id object-id
+                        :new-transaction transaction
+                        :old-transaction (load-transaction-id heap object-id))))
+
+(defun load-transaction-id (heap object-id)
+  (let* ((block (object-heap-position (object-table heap) object-id))
+         (buffer (load-block heap block :skip-header t)))
+    (multiple-value-bind (id nr-slots schema-id transaction-id previous)
+        (load-object-fields buffer object-id)
+      (declare (ignore id nr-slots schema-id previous))
+      transaction-id)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Committing a transaction
@@ -289,68 +341,21 @@ recovery can do its job if this transaction never completes."
          (heap (heap cache))
          (object-table (object-table heap))
          (version-list
-          ;; If the object-table entry is not marked :reserved, there
-          ;; is an object version list.  Get the start of that list.
-          (and (not (eql :reserved (object-info object-table object-id)))
-               (object-heap-position object-table object-id))))
-    (multiple-value-bind (younger-version older-version)
-        ;; Determine the correct position in the version list.
-        (version-list-position transaction-id object-id version-list heap)
-      ;; Write the object to a fresh block on the heap.
-      (let ((block (save-object object object-id cache 
-                                transaction-id older-version
-                                :schema schema)))
-        ;; Hook the block into the version list.
-        (if younger-version
-            ;; Let younger version point to this version.
-            (setf (object-version-list younger-version heap) block)
-          ;; There is no younger version, so this version becomes
-          ;; the start of the version list.
-          (setf (object-heap-position object-table object-id)
-                block)))))
+           ;; If the object-table entry is not marked :reserved, there
+           ;; is an object version list.  Get the start of that list.
+           (and (not (eql :reserved (object-info object-table object-id)))
+                (object-heap-position object-table object-id))))
+    (let ((block (save-object object object-id cache
+                              transaction-id version-list
+                              :schema schema)))
+      ;; This version becomes the start of the version list.
+      (setf (object-heap-position object-table object-id) block)))
   object-id)
-
-(defun version-list-position (current-transaction-id obj-id version-list heap)
-  "Returns the correct position for a transaction-id in a version-list.
-To be more precise, it returns:
-  1. the block of the object version with the oldest transaction that's
-younger than the given transaction-id (nil if there is no such version).
-  2. the block of the first object version in the version list that has
-a transaction id older than the given transaction-id (nil if there is no
-such version).
-  VERSION-LIST is either nil or the heap position of the first object
-version in the version list."
-  (and version-list
-       (let ((younger nil)
-             (block version-list))
-         (loop
-          (let ((buffer (load-block heap block :skip-header t)))
-            (multiple-value-bind (id nr-slots schema transaction-id previous)
-                (load-object-fields buffer obj-id)
-              ;; DO: Don't load id, nr-slots, schema at all!
-              (declare (ignore id nr-slots schema)) 
-              (cond ((< transaction-id current-transaction-id)
-                     ;; The version we're examining is older than the
-                     ;; current-transaction-id, so we found the right
-                     ;; place for the current version.
-                     (return-from version-list-position
-                       (values younger block)))
-                    ((null previous)
-                     ;; There is no version that's older than the current
-                     ;; transaction.  This can happen, because transaction
-                     ;; commits do not necessarily happen in transaction
-                     ;; creation order.
-                     (return-from version-list-position
-                       (values younger nil)))
-                    (t
-                     ;; Keep trying older versions.
-                     (setq younger block
-                           block previous)))))))))
 
 (defun (setf object-version-list) (old-block young-block heap)
   "Let the (previous pointer of the) object in YOUNG-BLOCK point to
 OLD-BLOCK."
-  (let ((stream (heap-stream heap)))
+  (with-heap-stream (stream heap)
     (file-position stream (+ young-block (block-header-size heap)))
     (serialize-previous-version-pointer old-block stream))
   old-block)
@@ -371,9 +376,8 @@ OLD-BLOCK."
   (queue-clear (dirty-queue transaction))
   (close-transaction cache transaction))
 
-
- 
-
-
-        
-
+(defmethod transaction-rollback-1 :around ((transaction concurrent-transaction)
+                                           (cache standard-cache)
+                                           (rucksack concurrent-transaction-rucksack))
+  (with-global-lock (rucksack)
+    (call-next-method)))

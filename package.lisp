@@ -71,8 +71,11 @@
    #:rucksack-do-class #:rucksack-do-slot
    #:rucksack-delete-object
 
+   #:reload-for-update
+
    ;; Transactions
    #:current-transaction
+   #:retry
 
    #:transaction-start #:transaction-commit #:transaction-rollback
    #:with-transaction #:*transaction*
@@ -83,7 +86,7 @@
    ;; Conditions
    #:rucksack-error #:simple-rucksack-error #:transaction-conflict
    #:internal-rucksack-error
-   #:duplicate-slot-value #:slot-error 
+   #:duplicate-slot-value #:slot-error
 
    ;; Indexes
    #:map-index #:index-insert #:index-delete #:make-index

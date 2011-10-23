@@ -8,8 +8,6 @@
 
 (defclass garbage-collector ()
   ((object-table :initarg :object-table :reader object-table)
-   (buffer :initform (make-instance 'serialization-buffer)
-           :reader serialization-buffer)
    (rucksack :initarg :rucksack :reader rucksack)
    ;; Some state used for incremental garbage collection.
    (roots :initarg :roots :initform '() :accessor roots
@@ -31,6 +29,9 @@
                ;; should probably be removed.
                :documentation
                "A flag to prevent recursive calls to COLLECT-SOME-GARBAGE.")))
+
+(defmethod serialization-buffer ((garbage-collector garbage-collector))
+  (make-instance 'serialization-buffer))
 
 
 (defgeneric scan (buffer garbage-collector)
@@ -130,8 +131,9 @@ rounded up.)")))
   ;; block (just behind the header) to indicate that this is a free
   ;; block.  This is necessary for the sweep phase of a mark-and-sweep
   ;; collector to distinguish it from a block that contains an object.
-  (file-position (heap-stream heap) (+ block (block-header-size heap)))
-  (serialize (- block-size) (heap-stream heap)))
+  (with-heap-stream (stream heap)
+    (file-position stream (+ block (block-header-size heap)))
+    (serialize (- block-size) stream)))
 
 
 (defmethod handle-written-object (object-id block (heap mark-and-sweep-heap))
@@ -329,17 +331,18 @@ collector."
 
 (defmethod load-block ((heap mark-and-sweep-heap) block
                        &key (buffer (serialization-buffer heap))
-                       (skip-header nil))
+                         (skip-header nil))
   ;; Loads the block at the specified position into the
   ;; serialization buffer.  If SKIP-HEADER is T, the block
   ;; header is not included.  Returns the buffer.
-  (load-buffer buffer
-               (heap-stream heap)
-               (block-size block heap)
-               :eof-error-p nil
-               :file-position (if skip-header
-                                  (+ block (block-header-size heap))
-                                block)))
+  (with-heap-stream (stream heap)
+    (load-buffer buffer
+                 stream
+                 (block-size block heap)
+                 :eof-error-p nil
+                 :file-position (if skip-header
+                                    (+ block (block-header-size heap))
+                                    block))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Sweeping the heap
@@ -353,34 +356,35 @@ collector."
          (work-done 0))
     ;; Sweep across the heap, looking for dead blocks.
     (loop
-     while (and (< work-done amount)
-                (< block (heap-end heap)))
-     do (multiple-value-bind (block-header block-start)
-            (read-block-start heap block)
-          ;; For non-free blocks, the block start contains a previous-pointer,
-          ;; which can be either nil or a positive integer.
-          ;; A negative block-start means the block already belongs to
-          ;; a free list. In that case, the block size is the abs of
-          ;; the block start.
-          ;; A non-negative (or nil) block-start means the block is occupied.
-          ;; In that case, the block size is in the header.
-          (let* ((free-p (and (integerp block-start) (minusp block-start)))
-                 (block-size (if free-p (- block-start) block-header)))
-            ;; Reclaim dead blocks.
-            (when (not free-p) ; only non-free blocks
-              (let* ((heap-stream (heap-stream heap))
-                     (object-id (progn
-                                  (deserialize heap-stream)
-                                  (deserialize heap-stream))))
-                (when (not (block-alive-p object-table object-id block))
-                  ;; The block is dead (either because the object is dead
-                  ;; or because the block contains an old version): return
-                  ;; the block to its free list.
-                  (deallocate-block block heap))))
-            ;;
-            (incf work-done block-size)
-            ;; Move to next block (if there is one).
-            (incf block block-size))))
+      while (and (< work-done amount)
+                 (< block (heap-end heap)))
+      do (multiple-value-bind (block-header block-start)
+             (read-block-start heap block)
+           ;; For non-free blocks, the block start contains a previous-pointer,
+           ;; which can be either nil or a positive integer.
+           ;; A negative block-start means the block already belongs to
+           ;; a free list. In that case, the block size is the abs of
+           ;; the block start.
+           ;; A non-negative (or nil) block-start means the block is occupied.
+           ;; In that case, the block size is in the header.
+           (let* ((free-p (and (integerp block-start) (minusp block-start)))
+                  (block-size (if free-p (- block-start) block-header)))
+             ;; Reclaim dead blocks.
+             (when (not free-p) ; only non-free blocks
+               (with-heap-stream (stream heap)
+                 (let* ((heap-stream stream)
+                        (object-id (progn
+                                     (deserialize heap-stream)
+                                     (deserialize heap-stream))))
+                   (when (not (block-alive-p object-table object-id block))
+                     ;; The block is dead (either because the object is dead
+                     ;; or because the block contains an old version): return
+                     ;; the block to its free list.
+                     (deallocate-block block heap)))))
+             ;;
+             (incf work-done block-size)
+             ;; Move to next block (if there is one).
+             (incf block block-size))))
     ;;
     (incf (nr-heap-bytes-sweeped heap) work-done)
     (when (>= block (heap-end heap))
@@ -401,7 +405,7 @@ collector."
   ;; followed by the previous version pointer (a serialized positive
   ;; integer or nil) or the block size (a serialized negative integer; for
   ;; free blocks).
-  (let ((stream (heap-stream heap)))
+  (with-heap-stream (stream heap)
     (file-position stream position)
     (let ((block-header (read-unsigned-bytes (cell-buffer heap) stream)))
       (file-position stream (+ 8 position))

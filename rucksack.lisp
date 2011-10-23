@@ -225,53 +225,6 @@ in which it appears."))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Locks
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(defun make-lock (&key (name "lock"))
-  #+allegro
-  (mp:make-process-lock :name name)
-  #+lispworks
-  (mp:make-lock :name name)
-  #+sbcl
-  (sb-thread:make-mutex :name name)
-  #+openmcl
-  (ccl:make-lock name)
-  #-(or allegro lispworks sbcl openmcl)
-  (not-implemented 'make-lock))
-
-
-(defmacro with-lock ((lock) &body body)
-  #+allegro
-  `(mp:with-process-lock (,lock) ,@body)
-  #+lispworks
-  `(mp:with-lock (,lock) ,@body)
-  #+sbcl
-  `(sb-thread:with-mutex (,lock) ,@body)
-  #+openmcl
-  `(ccl:with-lock-grabbed (,lock) ,@body)
-  #-(or allegro lispworks sbcl openmcl)
-  (not-implemented 'with-lock))
-
-(defun process-lock (lock)
-  #+lispworks
-  (mp:process-lock lock)
-  #+sbcl
-  (sb-thread:get-mutex lock)
-  #-(or sbcl lispworks)
-  (not-implemented 'process-lock))
-
-
-(defun process-unlock (lock)
-  #+lispworks
-  (mp:process-unlock lock)
-  #+sbcl
-  (sb-thread:release-mutex lock)
-  #-(or sbcl lispworks)
-  (not-implemented 'process-unlock))
-
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; WITH-TRANSACTION
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -354,6 +307,15 @@ slot index tables, where each slot index table is a btree mapping slot
 names to slot indexes.  Each slot index maps slot values to
 objects.")))
 
+(defclass concurrent-transaction-rucksack (standard-rucksack)
+  ((global-lock :initform (make-lock :name "Global lock")))
+  (:documentation
+   "A concurrent transaction rucksack."))
+
+(defmacro with-global-lock ((concurrent-transaction-rucksack) &body body)
+  `(with-lock ((slot-value ,concurrent-transaction-rucksack 'global-lock))
+     ,@body))
+
 (defmethod print-object ((rucksack rucksack) stream)
   (print-unreadable-object (rucksack stream :type t :identity t)
     (format stream "in ~S with ~D root~:P"
@@ -382,8 +344,31 @@ objects.")))
                              (rucksack-cache rucksack))))
     (if (current-transaction)
         (do-it)
-      (with-transaction (:rucksack rucksack)
-        (do-it)))))
+        (with-transaction (:rucksack rucksack)
+          (do-it)))))
+
+(defmethod class-index-table ((rucksack concurrent-transaction-rucksack))
+  "Lock is needed on creating index."
+  (flet ((do-it ()
+           (with-global-lock (rucksack)
+             (unless (slot-boundp rucksack 'class-index-table)
+               ;; Create a btree mapping class names to class
+               ;; indexes.
+               (let ((btree (make-instance 'btree
+                                           :rucksack rucksack
+                                           :key< 'string<
+                                           :value= 'p-eql
+                                           :unique-keys-p t
+                                           :dont-index t)))
+                 (setf (slot-value rucksack 'class-index-table) (object-id btree)
+                       (roots-changed-p rucksack) t))))
+           (cache-get-object (slot-value rucksack 'class-index-table)
+                             (rucksack-cache rucksack))))
+    (if (current-transaction)
+        (do-it)
+        (with-transaction (:rucksack rucksack)
+          (do-it)))))
+
 
 
 (defmethod slot-index-tables ((rucksack standard-rucksack))
@@ -497,16 +482,14 @@ objects.")))
 
 (defparameter *rucksack-opening-lock*
   (make-lock :name "Rucksack opening lock"))
- 
-(defun open-rucksack (directory-designator 
-                      &rest args
-                      &key 
-                      (class 'serial-transaction-rucksack)
+
+(defun open-rucksack (directory-designator
+                      &key
+                      (class 'concurrent-transaction-rucksack)
                       (if-exists :overwrite)
                       (if-does-not-exist :create)
-                      (cache-class 'lazy-cache)
-                      (cache-args '())
-                      &allow-other-keys)
+                      (cache-class 'concurrent-cache)
+                      (cache-args '()))
   "Opens the rucksack in the directory designated by DIRECTORY-DESIGNATOR.
   :IF-DOES-NOT-EXIST can be either :CREATE (creates a new rucksack if the
 it does not exist; this is the default) or :ERROR (signals an error if
@@ -514,11 +497,10 @@ the rucksack does not exist).
   :IF-EXISTS can be either :OVERWRITE (loads the rucksack if it exists;
 this is the default), :SUPERSEDE (deletes the existing rucksack and creates
 a new empty rucksack) or :ERROR (signals an error if the rucksack exists)."
-  (declare (ignorable cache-class cache-args))
   (check-type directory-designator (or string pathname))
   (check-type if-exists (member :overwrite :supersede :error))
   (check-type if-does-not-exist (member :create :error))
-  (let ((directory (if (stringp directory-designator)  
+  (let ((directory (if (stringp directory-designator)
                       (pathname directory-designator)
                       directory-designator)))
     (with-lock (*rucksack-opening-lock*)
@@ -535,10 +517,13 @@ already seems to contain a rucksack."
                    (loop for file in (rucksack-files-in-directory directory)
                          do (delete-file file))
                    ;; And create a fresh rucksack.
- 		   (apply #'make-instance class :directory directory args))
+ 		   #1=(apply #'make-instance class :directory directory
+                                                   :cache-class cache-class
+                                                   :cache-args cache-args
+                                                   nil))
                   (:overwrite
                    ;; This is the normal case.
-                   (apply #'make-instance class :directory directory args)))
+                   #1#))
               ;; Rucksack doesn't seem to exist.
               (ecase if-does-not-exist
                 (:error
@@ -547,7 +532,7 @@ file is missing."
                         directory))
                 (:create
                  (ensure-directories-exist directory)
-                 (apply #'make-instance class :directory directory args))))))))
+                 #1#)))))))
 
 
 (defun rucksack-files-in-directory (directory-pathname)
@@ -729,9 +714,9 @@ in the specified directory."
   (rucksack-add-class-index (current-rucksack) class-designator
                             :errorp errorp))
 
-(defun add-slot-index (class-designator slot index-spec &key (errorp nil))
+(defun add-slot-index (class-designator slot index-spec unique-p &key (errorp nil))
   (rucksack-add-slot-index (current-rucksack) class-designator slot index-spec
-                           :errorp errorp))
+                           unique-p :errorp errorp))
 
 (defun remove-class-index (class-designator &key (errorp nil))
   (rucksack-remove-class-index (current-rucksack) class-designator
@@ -1053,15 +1038,19 @@ index for slot ~S of class ~S in ~S."
     (let ((class-index (rucksack-class-index rucksack (class-of object)
                                              :errorp nil)))
       (when class-index
+        (cache-touch-object class-index (rucksack-cache rucksack))
         (index-delete class-index (object-id object) object)))
     ;; Remove object from slot indexes if necessary.
     (let ((indexed-slot-names (rucksack-indexed-slots-for-class rucksack
                                                                 (class-of object))))
-      (loop for slot-name in indexed-slot-names do
-            (index-delete (rucksack-slot-index rucksack class-name slot-name)
-                          (slot-value object slot-name)
-                          object
-                          :if-does-not-exist :ignore)))
+      (loop for slot-name in indexed-slot-names
+            for index = (rucksack-slot-index rucksack class-name slot-name)
+            do
+               (cache-touch-object index (rucksack-cache rucksack))
+               (index-delete index
+                             (slot-value object slot-name)
+                             object
+                             :if-does-not-exist :ignore)))
     ;; Remove object from roots if necessary.
     (when (rucksack-root-p object rucksack)
       (delete-rucksack-root object rucksack))))

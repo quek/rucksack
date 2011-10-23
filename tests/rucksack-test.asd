@@ -1,7 +1,7 @@
 ;;; -*- lisp -*-
 
 (asdf:defsystem rucksack-test
-  :depends-on (:rucksack)
+  :depends-on (:rucksack :bordeaux-threads)
   :components
     ((:file "lisp-unit")
      (:file "package")

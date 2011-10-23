@@ -35,8 +35,8 @@ transaction-conflict.")
               :reader object-id)))
 
 (defmethod print-object :after ((error transaction-conflict) stream)
-  (format stream "~&~A can't modify object #~D, because ~A already
-modified it and hasn't committed yet."
+  (format stream "~&~A can't modify object #~D, because #~A already
+modified it."
           (transaction error)
           (object-id error)
           (old-transaction error)))

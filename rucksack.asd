@@ -8,6 +8,7 @@
   :components ((:file "queue")
                (:file "package")
                (:file "errors")
+               (:file "thread")
                (:file "mop")
                (:file "serialize" )
                (:file "heap")

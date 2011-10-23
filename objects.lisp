@@ -95,7 +95,7 @@ for persistent-data instances.  Their contents are accessed by special
 functions like P-CAR instead."))
 
 (defmethod print-object ((object persistent-data) stream)
-  (print-unreadable-object (object stream :type t :identity nil)
+  (print-unreadable-object (object stream :type t :identity t)
     (format stream "#~D~@[ with transaction id ~D~]"
             (slot-value object 'object-id)
             (and (slot-boundp object 'transaction-id)
@@ -518,7 +518,8 @@ inherit from this class."))
                                         ;; when creating the indexes themselves
                                         ;; (to prevent infinite recursion).
                                         (dont-index nil)
-                                        &allow-other-keys)
+                                          &allow-other-keys)
+  (declare (ignore args))
   (maybe-update-slot-info (class-of object))
   ;; This happens when persistent-objects are created in memory, not when
   ;; they're loaded from the cache (loading uses ALLOCATE-INSTANCE instead).
@@ -554,10 +555,11 @@ inherit from this class."))
 
 
 (defmethod print-object ((object persistent-object) stream)
-  (print-unreadable-object (object stream :type t :identity nil)
+  (print-unreadable-object (object stream :type t :identity t)
     (format stream "#~D~@[ with transaction id ~D~]"
             (slot-value object 'object-id)
-            (transaction-id object))))
+            (and (slot-boundp object 'transaction-id)
+                 (slot-value object 'transaction-id)))))
 
 
 ;; It's a bit stupid that we have to write the same code for three
@@ -647,6 +649,7 @@ inherit from this class."))
   #+lispworks(values (find slot-name-or-def (class-slots class)
                            :key #'slot-definition-name)
                      slot-name-or-def)
+  #-lispworks(declare (ignore class))
   #-lispworks(values slot-name-or-def
                      (slot-definition-name slot-name-or-def)))
 
@@ -718,8 +721,8 @@ inherit from this class."))
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defmethod save-object (object object-id (cache standard-cache)
-                               transaction-id previous-block
-                               &key schema)
+                        transaction-id previous-block
+                        &key schema)
   "Serializes the object to a buffer, allocates a heap block of the right
 size and writes the buffer to the block.  Returns the (heap position of the)
 block containing the object."
@@ -744,14 +747,15 @@ block containing the object."
       (loop for slot-name in (persistent-slot-names schema)
             do (if (slot-boundp object slot-name)
                    (serialize (slot-value object slot-name) buffer)
-                 (serialize-marker +unbound-slot+ buffer))))
+                   (serialize-marker +unbound-slot+ buffer))))
     ;; Allocate a heap block of the right size.
     (let* ((size (+ (buffer-count buffer)
                     (block-header-size heap)))
            (block (allocate-block heap :size size)))
       ;; Save the serialized buffer in the block.
-      (save-buffer buffer (heap-stream heap)
-                   :file-position (+ block (block-header-size heap)))
+      (with-heap-stream (stream heap)
+        (save-buffer buffer stream
+                     :file-position (+ block (block-header-size heap))))
       (handle-written-object object-id block heap)
       ;; Return the block.
       block)))
@@ -776,7 +780,7 @@ block containing the object."
 ;;
 
 (defmethod load-object (object-id transaction (cache standard-cache))
-  (multiple-value-bind (buffer id nr-slots schema-id most-recent-p)
+  (multiple-value-bind (buffer id nr-slots schema-id most-recent-p transaction-id)
       (find-committed-object-version object-id
                                      (transaction-id transaction)
                                      (heap cache))
@@ -820,7 +824,7 @@ block containing the object."
         (when (typep object '(or persistent-object persistent-data))
           (setf (slot-value object 'rucksack) (current-rucksack)
                 (slot-value object 'object-id) object-id
-                (slot-value object 'transaction-id) (transaction-id transaction)))
+                (slot-value object 'transaction-id) transaction-id))
         ;; Call UPDATE-PERSISTENT-INSTANCE-FOR-REDEFINED-CLASS if necessary.
         (when (schema-obsolete-p schema)
           (update-persistent-instance-for-redefined-class
@@ -832,7 +836,7 @@ block containing the object."
       (values object most-recent-p))))
 
 (defun find-committed-object-version (object-id current-transaction-id heap)
-  "Returns the buffer, id, nr-slots and schema-id of the object
+  "Returns the buffer, id, nr-slots, schema-id and transaction-id of the object
 containing the compatible version for the given transaction id.  The
 buffer points to the first octet after the standard object fields.
 As a fifth value, it returns a boolean that's true when the object
@@ -849,7 +853,7 @@ of the object version list)."
          (cond ((<= transaction-id current-transaction-id)
                 ;; We found the 'compatible' object version: the most recent
                 ;; version that's not younger than the current transaction.
-                (return (values buffer id nr-slots schema-id most-recent-p)))
+                (return (values buffer id nr-slots schema-id most-recent-p transaction-id)))
                ((null prev-version)
                 ;; Oh oh.
                 (internal-rucksack-error "Can't find compatible object
